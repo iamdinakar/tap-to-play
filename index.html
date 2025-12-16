@@ -1,0 +1,392 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Lane Flip — One-Tap Dodge</title>
+  <style>
+    :root { color-scheme: dark; }
+    html, body { height: 100%; margin: 0; background:#0b0d12; overflow:hidden; }
+    canvas { display:block; width:100vw; height:100vh; touch-action: none; }
+    .hint {
+      position: fixed; left: 50%; transform: translateX(-50%);
+      bottom: max(16px, env(safe-area-inset-bottom));
+      font: 600 13px/1.3 system-ui, -apple-system, Segoe UI, Roboto, Arial;
+      letter-spacing:.2px; opacity:.75; user-select:none; pointer-events:none;
+      text-align:center;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="c" aria-label="Lane Flip game canvas"></canvas>
+  <div class="hint">Tap to start · Tap to switch lanes · Don’t get hit</div>
+
+  <script>
+  (() => {
+    const canvas = document.getElementById("c");
+    const ctx = canvas.getContext("2d", { alpha: false });
+
+    // High-DPI resize
+    const DPR = () => Math.max(1, Math.min(3, window.devicePixelRatio || 1));
+    let W = 0, H = 0, dpr = DPR();
+    function resize() {
+      dpr = DPR();
+      W = Math.floor(innerWidth);
+      H = Math.floor(innerHeight);
+      canvas.width = Math.floor(W * dpr);
+      canvas.height = Math.floor(H * dpr);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    }
+    addEventListener("resize", resize, { passive: true });
+    resize();
+
+    // Game state
+    const S = {
+      mode: "ready", // ready | play | over
+      t: 0,
+      score: 0,
+      best: Number(localStorage.getItem("laneFlipBest") || 0),
+      lane: 0, // 0 left, 1 right
+      shake: 0,
+      speed: 420,        // px/s obstacle fall speed
+      spawnEvery: 0.78,  // seconds
+      spawnAcc: 0,
+      difficulty: 0
+    };
+
+    const obstacles = [];
+    function reset() {
+      obstacles.length = 0;
+      S.mode = "ready";
+      S.score = 0;
+      S.lane = 0;
+      S.shake = 0;
+      S.speed = 420;
+      S.spawnEvery = 0.78;
+      S.spawnAcc = 0;
+      S.difficulty = 0;
+      S.t = 0;
+    }
+
+    // Helpers
+    const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+    const rnd = (a, b) => a + Math.random() * (b - a);
+
+    function lanes() {
+      const cxL = W * 0.33;
+      const cxR = W * 0.67;
+      return [cxL, cxR];
+    }
+
+    function spawnObstacle() {
+      const [cxL, cxR] = lanes();
+      // Slight bias against repeating too predictably
+      const last = obstacles.length ? obstacles[obstacles.length - 1].lane : -1;
+      let lane = Math.random() < 0.5 ? 0 : 1;
+      if (lane === last && Math.random() < 0.55) lane = 1 - lane;
+
+      const size = rnd(18, 30);
+      const x = lane === 0 ? cxL : cxR;
+      const y = -60;
+      obstacles.push({
+        lane,
+        x,
+        y,
+        r: size,
+        passed: false
+      });
+    }
+
+    // Input (tap/click)
+    function onTap() {
+      if (S.mode === "ready") {
+        S.mode = "play";
+        return;
+      }
+      if (S.mode === "over") {
+        reset();
+        return;
+      }
+      // play: switch lane
+      S.lane = 1 - S.lane;
+    }
+
+    // Prevent scroll + capture taps
+    const opts = { passive: false };
+    addEventListener("touchstart", (e) => { e.preventDefault(); onTap(); }, opts);
+    addEventListener("mousedown", (e) => { e.preventDefault(); onTap(); }, opts);
+    addEventListener("keydown", (e) => {
+      if (e.code === "Space" || e.code === "Enter" || e.code === "ArrowUp") { e.preventDefault(); onTap(); }
+      if (e.code === "ArrowLeft") S.lane = 0;
+      if (e.code === "ArrowRight") S.lane = 1;
+    }, { passive: false });
+
+    // Tiny click sound (optional, no assets)
+    let audioCtx = null;
+    function blip(freq = 520, dur = 0.04) {
+      try {
+        audioCtx ||= new (window.AudioContext || window.webkitAudioContext)();
+        const t0 = audioCtx.currentTime;
+        const o = audioCtx.createOscillator();
+        const g = audioCtx.createGain();
+        o.type = "square";
+        o.frequency.setValueAtTime(freq, t0);
+        g.gain.setValueAtTime(0.04, t0);
+        g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+        o.connect(g).connect(audioCtx.destination);
+        o.start(t0);
+        o.stop(t0 + dur);
+      } catch {}
+    }
+
+    // Drawing
+    function drawBG() {
+      // base
+      ctx.fillStyle = "#0b0d12";
+      ctx.fillRect(0, 0, W, H);
+
+      // subtle grid/lines
+      ctx.globalAlpha = 0.12;
+      ctx.strokeStyle = "#9fb3ff";
+      ctx.lineWidth = 1;
+      for (let y = 0; y < H; y += 48) {
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(W, y);
+        ctx.stroke();
+      }
+      ctx.globalAlpha = 1;
+
+      // lane guides
+      const [cxL, cxR] = lanes();
+      ctx.globalAlpha = 0.25;
+      ctx.strokeStyle = "#ffffff";
+      ctx.setLineDash([10, 12]);
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(cxL, 0);
+      ctx.lineTo(cxL, H);
+      ctx.moveTo(cxR, 0);
+      ctx.lineTo(cxR, H);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.globalAlpha = 1;
+    }
+
+    function drawHUD() {
+      ctx.fillStyle = "#eaf0ff";
+      ctx.font = "700 20px system-ui, -apple-system, Segoe UI, Roboto, Arial";
+      ctx.textAlign = "left";
+      ctx.fillText(`Score: ${S.score}`, 16, 32);
+
+      ctx.textAlign = "right";
+      ctx.globalAlpha = 0.9;
+      ctx.fillText(`Best: ${S.best}`, W - 16, 32);
+      ctx.globalAlpha = 1;
+
+      if (S.mode !== "play") {
+        const title = S.mode === "ready" ? "LANE FLIP" : "GAME OVER";
+        const sub = S.mode === "ready"
+          ? "Tap to start. Tap to switch lanes."
+          : "Tap to retry.";
+
+        ctx.textAlign = "center";
+        ctx.fillStyle = "#eaf0ff";
+        ctx.font = "900 44px system-ui, -apple-system, Segoe UI, Roboto, Arial";
+        ctx.fillText(title, W / 2, H * 0.36);
+
+        ctx.globalAlpha = 0.9;
+        ctx.font = "600 16px system-ui, -apple-system, Segoe UI, Roboto, Arial";
+        ctx.fillText(sub, W / 2, H * 0.36 + 34);
+        ctx.globalAlpha = 1;
+
+        if (S.mode === "over") {
+          ctx.globalAlpha = 0.85;
+          ctx.font = "700 18px system-ui, -apple-system, Segoe UI, Roboto, Arial";
+          ctx.fillText(`Final: ${S.score}`, W / 2, H * 0.36 + 70);
+          ctx.globalAlpha = 1;
+        }
+      }
+    }
+
+    function drawPlayer() {
+      const [cxL, cxR] = lanes();
+      const x = S.lane === 0 ? cxL : cxR;
+      const y = H * 0.82;
+      const r = clamp(Math.min(W, H) * 0.028, 12, 20);
+
+      // glow
+      ctx.globalAlpha = 0.15;
+      ctx.beginPath();
+      ctx.arc(x, y, r * 2.2, 0, Math.PI * 2);
+      ctx.fillStyle = "#7aa2ff";
+      ctx.fill();
+      ctx.globalAlpha = 1;
+
+      // body
+      ctx.beginPath();
+      ctx.arc(x, y, r, 0, Math.PI * 2);
+      ctx.fillStyle = "#d7e3ff";
+      ctx.fill();
+
+      // eye dot to show direction
+      ctx.beginPath();
+      ctx.arc(x + (S.lane ? 5 : -5), y - 4, Math.max(2, r * 0.18), 0, Math.PI * 2);
+      ctx.fillStyle = "#0b0d12";
+      ctx.fill();
+
+      return { x, y, r };
+    }
+
+    function drawObstacle(o) {
+      // capsule-ish circle
+      ctx.beginPath();
+      ctx.arc(o.x, o.y, o.r, 0, Math.PI * 2);
+      ctx.fillStyle = "#ff5d7a";
+      ctx.fill();
+
+      ctx.globalAlpha = 0.22;
+      ctx.beginPath();
+      ctx.arc(o.x - o.r*0.25, o.y - o.r*0.25, o.r*0.55, 0, Math.PI * 2);
+      ctx.fillStyle = "#ffffff";
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+
+    // Collision
+    function hit(player, o) {
+      const dx = player.x - o.x;
+      const dy = player.y - o.y;
+      const rr = player.r + o.r;
+      return (dx*dx + dy*dy) <= rr*rr;
+    }
+
+    // Main loop
+    let last = performance.now();
+    function frame(now) {
+      const dt = Math.min(0.033, (now - last) / 1000);
+      last = now;
+      S.t += dt;
+
+      // Update
+      if (S.mode === "play") {
+        S.spawnAcc += dt;
+
+        // Slowly ramp difficulty
+        S.difficulty += dt;
+        const targetSpeed = 420 + S.difficulty * 26; // increases over time
+        S.speed = Math.min(980, targetSpeed);
+        S.spawnEvery = Math.max(0.36, 0.78 - S.difficulty * 0.018);
+
+        while (S.spawnAcc >= S.spawnEvery) {
+          S.spawnAcc -= S.spawnEvery;
+          spawnObstacle();
+        }
+
+        const fall = S.speed * dt;
+        for (const o of obstacles) o.y += fall;
+
+        // Scoring: passed player line
+        const passY = H * 0.82;
+        for (const o of obstacles) {
+          if (!o.passed && o.y - o.r > passY) {
+            o.passed = true;
+            S.score += 1;
+            blip(520 + Math.min(420, S.score * 8), 0.03);
+          }
+        }
+
+        // Cleanup
+        while (obstacles.length && obstacles[0].y - obstacles[0].r > H + 80) obstacles.shift();
+
+        // Collision check
+        const player = { ...drawPlayer() }; // quick way to reuse coords; will redraw later anyway
+        // (We won't keep this draw; we're drawing again below. But it's tiny + avoids duplicating logic.)
+        for (const o of obstacles) {
+          if (hit(player, o)) {
+            S.mode = "over";
+            S.shake = 0.18;
+            S.best = Math.max(S.best, S.score);
+            localStorage.setItem("laneFlipBest", String(S.best));
+            blip(180, 0.08);
+            blip(120, 0.10);
+            break;
+          }
+        }
+      }
+
+      // Draw (with tiny screen shake on hit)
+      drawBG();
+
+      if (S.shake > 0) {
+        S.shake = Math.max(0, S.shake - dt);
+        const mag = 10 * (S.shake / 0.18);
+        ctx.save();
+        ctx.translate(rnd(-mag, mag), rnd(-mag, mag));
+        renderScene();
+        ctx.restore();
+      } else {
+        renderScene();
+      }
+
+      requestAnimationFrame(frame);
+    }
+
+    function renderScene() {
+      // obstacles
+      for (const o of obstacles) drawObstacle(o);
+
+      // player
+      const [cxL, cxR] = lanes();
+      const x = S.lane === 0 ? cxL : cxR;
+      const y = H * 0.82;
+      const r = clamp(Math.min(W, H) * 0.028, 12, 20);
+
+      // "landing" shadow
+      ctx.globalAlpha = 0.25;
+      ctx.beginPath();
+      ctx.ellipse(x, y + r + 10, r * 1.1, r * 0.45, 0, 0, Math.PI * 2);
+      ctx.fillStyle = "#000";
+      ctx.fill();
+      ctx.globalAlpha = 1;
+
+      // player body
+      ctx.beginPath();
+      ctx.arc(x, y, r * 2.2, 0, Math.PI * 2);
+      ctx.globalAlpha = 0.10;
+      ctx.fillStyle = "#7aa2ff";
+      ctx.fill();
+      ctx.globalAlpha = 1;
+
+      ctx.beginPath();
+      ctx.arc(x, y, r, 0, Math.PI * 2);
+      ctx.fillStyle = "#d7e3ff";
+      ctx.fill();
+
+      ctx.beginPath();
+      ctx.arc(x + (S.lane ? 5 : -5), y - 4, Math.max(2, r * 0.18), 0, Math.PI * 2);
+      ctx.fillStyle = "#0b0d12";
+      ctx.fill();
+
+      // HUD
+      drawHUD();
+
+      // Ready mode: show "ghost" lane indicator
+      if (S.mode !== "play") {
+        ctx.globalAlpha = 0.18;
+        ctx.fillStyle = "#7aa2ff";
+        const otherX = S.lane === 0 ? cxR : cxL;
+        ctx.beginPath();
+        ctx.arc(otherX, y, r * 0.95, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.globalAlpha = 1;
+      }
+    }
+
+    // Start
+    reset();
+    requestAnimationFrame(frame);
+  })();
+  </script>
+</body>
+</html>
